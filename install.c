@@ -36,6 +36,7 @@
 #include "firmware.h"
 
 #include "extendedcommands.h"
+#include "settings.h"
 
 
 #define ASSUMED_UPDATE_BINARY_NAME  "META-INF/com/google/android/update-binary"
@@ -255,6 +256,7 @@ try_update_binary(const char *path, ZipArchive *zip) {
         mzCloseZipArchive(zip);
         return ret;
     }
+    remove("/cache/update.zip");
     return INSTALL_SUCCESS;
 }
 

@@ -97,7 +97,7 @@ int maybe_install_firmware_update(const char *send_intent) {
 
     int width = 0, height = 0, bpp = 0;
     char *busy_image = ui_copy_image(
-        BACKGROUND_ICON_FIRMWARE_INSTALLING, &width, &height, &bpp);
+        BACKGROUND_ICON_INSTALLING, &width, &height, &bpp);
     char *fail_image = ui_copy_image(
         BACKGROUND_ICON_FIRMWARE_ERROR, &width, &height, &bpp);
 
