@@ -1,0 +1,503 @@
+/*
+ * Copyright (C) 2012 Michael L. Schaecher
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <limits.h>
+#include <linux/input.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/reboot.h>
+#include <reboot/reboot.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <sys/wait.h>
+#include <sys/limits.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+#include <signal.h>
+#include <sys/wait.h>
+
+#include "bootloader.h"
+#include "common.h"
+#include "cutils/properties.h"
+#include "firmware.h"
+#include "install.h"
+#include "minui/minui.h"
+#include "minzip/DirUtil.h"
+#include "roots.h"
+#include "recovery_ui.h"
+
+#include "../../external/yaffs2/yaffs2/utils/mkyaffs2image.h"
+#include "../../external/yaffs2/yaffs2/utils/unyaffs.h"
+
+#include "extendedcommands.h"
+#include "settings.h"
+#include "nandroid.h"
+#include "mounts.h"
+#include "flashutils/flashutils.h"
+#include "edify/expr.h"
+#include <libgen.h>
+#include "mtdutils/mtdutils.h"
+#include "bmlutils/bmlutils.h"
+
+#define ABS_MT_POSITION_X 0x35  /* Center X ellipse position */
+#define ABS_MT_POSITION_Y 0x36  /* Center Y ellipse position */
+
+#define MKE2FS_BIN      "/sbin/mke2fs"
+#define TUNE2FS_BIN     "/sbin/tune2fs"
+#define E2FSCK_BIN      "/sbin/e2fsck"
+
+int format_device(const char *device, const char *path, const char *fs_type) {
+    Volume* v = volume_for_path(path);
+    if (v == NULL) {
+        // no /sdcard? let's assume /data/media
+        if (strstr(path, "/sdcard") == path && is_data_media()) {
+            return format_unknown_device(NULL, path, NULL);
+        }
+        // silent failure for sd-ext
+        if (strcmp(path, "/sd-ext") == 0)
+            return -1;
+        LOGE("unknown volume \"%s\"\n", path);
+        return -1;
+    }
+    if (strcmp(fs_type, "ramdisk") == 0) {
+        // you can't format the ramdisk.
+        LOGE("can't format_volume \"%s\"", path);
+        return -1;
+    }
+
+    if (strcmp(fs_type, "rfs") == 0) {
+        if (ensure_path_unmounted(path) != 0) {
+            LOGE("format_volume failed to unmount \"%s\"\n", v->mount_point);
+            return -1;
+        }
+        if (0 != format_rfs_device(device, path)) {
+            LOGE("format_volume: format_rfs_device failed on %s\n", device);
+            return -1;
+        }
+        return 0;
+    }
+ 
+    if (strcmp(v->mount_point, path) != 0) {
+        return format_unknown_device(v->device, path, NULL);
+    }
+
+    if (ensure_path_unmounted(path) != 0) {
+        LOGE("format_volume failed to unmount \"%s\"\n", v->mount_point);
+        return -1;
+    }
+
+    if (strcmp(fs_type, "yaffs2") == 0 || strcmp(fs_type, "mtd") == 0) {
+        mtd_scan_partitions();
+        const MtdPartition* partition = mtd_find_partition_by_name(device);
+        if (partition == NULL) {
+            LOGE("format_volume: no MTD partition \"%s\"\n", device);
+            return -1;
+        }
+
+        MtdWriteContext *write = mtd_write_partition(partition);
+        if (write == NULL) {
+            LOGW("format_volume: can't open MTD \"%s\"\n", device);
+            return -1;
+        } else if (mtd_erase_blocks(write, -1) == (off_t) -1) {
+            LOGW("format_volume: can't erase MTD \"%s\"\n", device);
+            mtd_write_close(write);
+            return -1;
+        } else if (mtd_write_close(write)) {
+            LOGW("format_volume: can't close MTD \"%s\"\n",device);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (strcmp(fs_type, "ext4") == 0) {
+        reset_ext4fs_info();
+        int result = make_ext4fs(device, NULL, NULL, 0, 0, 0);
+        if (result != 0) {
+            LOGE("format_volume: make_extf4fs failed on %s\n", device);
+            return -1;
+        }
+        return 0;
+    }
+
+    return format_unknown_device(device, path, fs_type);
+}
+
+int format_unknown_device(const char *device, const char* path, const char *fs_type)
+{
+    LOGI("Formatting unknown device.\n");
+
+    if (fs_type != NULL && get_flash_type(fs_type) != UNSUPPORTED)
+        return erase_raw_partition(fs_type, device);
+
+    // if this is SDEXT:, don't worry about it if it does not exist.
+    if (0 == strcmp(path, "/sd-ext"))
+    {
+        struct stat st;
+        Volume *vol = volume_for_path("/sd-ext");
+        if (vol == NULL || 0 != stat(vol->device, &st))
+        {
+            ui_print("No app2sd partition found. Skipping format of /sd-ext.\n");
+            return 0;
+        }
+    }
+
+    if (NULL != fs_type) {
+        if (strcmp("ext3", fs_type) == 0) {
+            LOGI("Formatting ext3 device.\n");
+            if (0 != ensure_path_unmounted(path)) {
+                LOGE("Error while unmounting %s.\n", path);
+                return -12;
+            }
+            return format_ext3_device(device);
+        }
+
+        if (strcmp("ext2", fs_type) == 0) {
+            LOGI("Formatting ext2 device.\n");
+            if (0 != ensure_path_unmounted(path)) {
+                LOGE("Error while unmounting %s.\n", path);
+                return -12;
+            }
+            return format_ext2_device(device);
+        }
+    }
+
+    if (0 != ensure_path_mounted(path))
+    {
+        ui_print("Error mounting %s!\n", path);
+        ui_print("Skipping format...\n");
+        return 0;
+    }
+
+    static char tmp[PATH_MAX];
+    if (strcmp(path, "/data") == 0) {
+        sprintf(tmp, "cd /data ; for f in $(ls -a | grep -v ^media$); do rm -rf $f; done");
+        __system(tmp);
+    }
+    else {
+        sprintf(tmp, "rm -rf %s/*", path);
+        __system(tmp);
+        sprintf(tmp, "rm -rf %s/.*", path);
+        __system(tmp);
+    }
+
+    ensure_path_unmounted(path);
+    return 0;
+}
+
+//#define MOUNTABLE_COUNT 5
+//#define DEVICE_COUNT 4
+//#define MMC_COUNT 2
+
+typedef struct {
+    char mount[255];
+    char unmount[255];
+    Volume* v;
+} MountMenuEntry;
+
+typedef struct {
+    char txt[255];
+    Volume* v;
+} FormatMenuEntry;
+
+int is_safe_to_format(char* name)
+{
+    char str[255];
+    char* partition;
+    property_get("ro.cwm.forbid_format", str, "/misc,/radio,/bootloader,/recovery,/efs");
+
+    partition = strtok(str, ", ");
+    while (partition != NULL) {
+        if (strcmp(name, partition) == 0) {
+            return 0;
+        }
+        partition = strtok(NULL, ", ");
+    }
+
+    return 1;
+}
+
+void show_partition_menu()
+{
+    static char* headers[] = {  "Mounts and Storage Menu",
+                                "",
+                                NULL
+    };
+
+    static MountMenuEntry* mount_menue = NULL;
+    static FormatMenuEntry* format_menue = NULL;
+
+    typedef char* string;
+
+    int i, mountable_volumes, formatable_volumes;
+    int num_volumes;
+    Volume* device_volumes;
+
+    num_volumes = get_num_volumes();
+    device_volumes = get_device_volumes();
+
+    string options[255];
+
+    if(!device_volumes)
+		return;
+
+		mountable_volumes = 0;
+		formatable_volumes = 0;
+
+		mount_menue = malloc(num_volumes * sizeof(MountMenuEntry));
+		format_menue = malloc(num_volumes * sizeof(FormatMenuEntry));
+
+		for (i = 0; i < num_volumes; ++i) {
+			Volume* v = &device_volumes[i];
+			if(strcmp("ramdisk", v->fs_type) != 0 && strcmp("mtd", v->fs_type) != 0 && strcmp("emmc", v->fs_type) != 0 && strcmp("bml", v->fs_type) != 0)
+			{
+				sprintf(&mount_menue[mountable_volumes].mount, "mount %s", v->mount_point);
+				sprintf(&mount_menue[mountable_volumes].unmount, "unmount %s", v->mount_point);
+				mount_menue[mountable_volumes].v = &device_volumes[i];
+				++mountable_volumes;
+				if (is_safe_to_format(v->mount_point)) {
+					sprintf(&format_menue[formatable_volumes].txt, "format %s", v->mount_point);
+					format_menue[formatable_volumes].v = &device_volumes[i];
+					++formatable_volumes;
+				}
+		    }
+		    else if (strcmp("ramdisk", v->fs_type) != 0 && strcmp("mtd", v->fs_type) == 0 && is_safe_to_format(v->mount_point))
+		    {
+				sprintf(&format_menue[formatable_volumes].txt, "format %s", v->mount_point);
+				format_menue[formatable_volumes].v = &device_volumes[i];
+				++formatable_volumes;
+			}
+		}
+
+
+    static char* confirm_format  = "Confirm format?";
+    static char* confirm = "Yes - Format";
+    char confirm_string[255];
+
+    for (;;)
+    {
+
+		for (i = 0; i < mountable_volumes; i++)
+		{
+			MountMenuEntry* e = &mount_menue[i];
+			Volume* v = e->v;
+			if(is_path_mounted(v->mount_point))
+				options[i] = e->unmount;
+			else
+				options[i] = e->mount;
+		}
+
+		for (i = 0; i < formatable_volumes; i++)
+		{
+			FormatMenuEntry* e = &format_menue[i];
+
+			options[mountable_volumes+i] = e->txt;
+		}
+
+        options[mountable_volumes+formatable_volumes] = "mount USB storage";
+        options[mountable_volumes+formatable_volumes + 1] = NULL;
+
+        int chosen_item = get_menu_selection(headers, &options, 0, 0);
+        if (chosen_item == GO_BACK)
+            break;
+        if (chosen_item == (mountable_volumes+formatable_volumes))
+        {
+            show_mount_usb_storage_menu();
+        }
+        else if (chosen_item < mountable_volumes)
+        {
+			MountMenuEntry* e = &mount_menue[chosen_item];
+            Volume* v = e->v;
+
+            if (is_path_mounted(v->mount_point))
+            {
+                if (0 != ensure_path_unmounted(v->mount_point))
+                    ui_print("Error unmounting %s!\n", v->mount_point);
+            }
+            else
+            {
+                if (0 != ensure_path_mounted(v->mount_point))
+                    ui_print("Error mounting %s!\n",  v->mount_point);
+            }
+        }
+        else if (chosen_item < (mountable_volumes + formatable_volumes))
+        {
+            chosen_item = chosen_item - mountable_volumes;
+            FormatMenuEntry* e = &format_menue[chosen_item];
+            Volume* v = e->v;
+
+            sprintf(confirm_string, "%s - %s", v->mount_point, confirm_format);
+
+            if (!confirm_selection(confirm_string, confirm))
+                continue;
+            ui_print("Formatting %s...\n", v->mount_point);
+            if (0 != format_volume(v->mount_point))
+                ui_print("Error formatting %s!\n", v->mount_point);
+            else
+                ui_print("Done.\n");
+        }
+    }
+
+    free(mount_menue);
+    free(format_menue);
+
+}
+
+void show_wipe_data_menu()
+{
+    static char* headers[3];
+    headers[0] = "Wipe & Format Menu";
+    headers[1] = "\n";
+    headers[2] = NULL;
+                               
+    static char* list[5];
+    list[0] = "Cache Dalvik-Cache";
+    list[1] = "Data/Factory Reset";
+    list[2] = "Prepare for Update";
+    list[3] = "Prepare for New Install";
+    list[4] = NULL;
+
+    for (;;) {
+
+        int status = INSTALL_SUCCESS;
+        int chosen_menu = get_menu_selection(headers, list, 0, 0);
+        if (chosen_menu == GO_BACK)
+            break;
+        switch (chosen_menu)
+        {
+            case 0:
+            {
+                if (confirm_selection("Confirm Wipe Cache/Dalvik-Cache?", "Yes - Wipe Cache?"))
+                {
+                    ui_set_background(BACKGROUND_ICON_INSTALLING);
+                    ui_print("\n-- Wiping cache...\n");
+                if (0 != ensure_path_mounted("/data"))
+                    break;
+                    if (format_volume("/cache")) status = INSTALL_ERROR;
+                    if (status != INSTALL_SUCCESS) {
+                        ui_set_background(BACKGROUND_ICON_ERROR);
+                        LOGI("Cache/Dalvik-Cache wipe\n --failed!\n");
+                        ui_print("-- Try again manually!\n");
+                    } else {
+                        ui_print("Cache wipe complete.\n");
+                        ui_print("Preparing to wipe dalvik-cache..\n\n");
+                        if (0 != ensure_path_mounted("/data"))
+                            break;
+                        ensure_path_mounted("/sd-ext");
+                        ensure_path_mounted("/cache");
+                        __system(UPDATING_FORMAT_CASHE);
+                        ui_print("Dalvik-Cache wiped.\n");
+                        ensure_path_unmounted("/data");
+                        ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+                        return show_wipe_data_menu();
+                    }
+                }
+                break;
+
+            }
+            case 1:
+            {
+                if (confirm_selection("Confirm Data/Factory Reset?", "Yes - Format User Data?"))
+                {
+                    ui_set_background(BACKGROUND_ICON_INSTALLING);
+                    ui_print("Preparing to wipe User Data...\n");
+                    if (device_wipe_data()) status = INSTALL_ERROR;
+                    if (format_volume("/data")) status = INSTALL_ERROR;
+                    if (format_volume("/cache")) status = INSTALL_ERROR;
+		    if (has_datadata()) {
+			format_volume("/datadata");
+		    }
+                    if (status != INSTALL_SUCCESS) {
+                        ui_set_background(BACKGROUND_ICON_ERROR);
+                        LOGI("User Data wipe\n --failed!\n");
+                        ui_print("-- Try again manually!\n");
+                    } else {
+                        format_volume("/sd-ext");
+		        format_volume("/sdcard/.android_secure");
+		        ui_print("Data wipe complete.\n");
+                        ensure_path_unmounted("/data");
+                        ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+                        return show_wipe_data_menu();
+                    }
+		}
+                break;
+            }
+            case 2:
+            {
+                if (confirm_selection("Confirm Prepare for Update?", "Yes - Wipe Data/Data & Cache"))
+                {
+                    ui_set_background(BACKGROUND_ICON_INSTALLING);
+                    ui_print("Preparing to Wipe Data/Data ...\n\n");
+                if (0 != ensure_path_mounted("/data"))
+                    break;
+                    ensure_path_mounted("/sd-ext");
+                    ensure_path_mounted("/cache");
+                    __system(UPDATING_FORMAT_DATA);
+                    ui_print(" -- Formating system -- \n");
+                    if (format_volume("/boot")) status = INSTALL_ERROR;
+                    if (format_volume("/system")) status = INSTALL_ERROR;
+                    if (format_volume("/cache")) status = INSTALL_ERROR;
+                    if (status != INSTALL_SUCCESS) {
+                        ui_set_background(BACKGROUND_ICON_ERROR);
+                        LOGI("System format failed!\n");
+                        ui_print("-- Try again manually!\n");
+                    } else {
+		        ui_print("Data/Data wipe complete.\n");
+                        ensure_path_unmounted("/data");
+                        ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+                        return show_wipe_data_menu();
+                    }
+                }
+                break;
+
+            }
+            case 3:
+            {   
+		if (confirm_selection("Confirm Format Everything?", "Yes - Format Everything"))
+		{
+                    ui_set_background(BACKGROUND_ICON_INSTALLING);
+		    ui_print("\n-- Formaatting all partitions...\n");
+                    if (format_volume("/boot")) status = INSTALL_ERROR;
+                    if (format_volume("/system")) status = INSTALL_ERROR;
+                    if (format_volume("/data")) status = INSTALL_ERROR;
+		    if (has_datadata()) {
+			format_volume("/datadata");
+		    }
+                    if (status != INSTALL_SUCCESS) {
+                        ui_set_background(BACKGROUND_ICON_ERROR);
+                        LOGI("System forma failed!\n");
+                        ui_print("-- Try again manually!\n");
+                    } else {
+                        format_volume("/sd-ext");
+                        format_volume("/sdcard/.android_secure");
+                        ensure_path_unmounted("/data");
+		        ui_print("\nFormat complete!\n");
+                        return show_wipe_data_menu();
+                    }
+		}
+		break;
+            }
+        }
+    }
+}
+

@@ -37,6 +37,7 @@
 #include "../../external/yaffs2/yaffs2/utils/unyaffs.h"
 
 #include "extendedcommands.h"
+#include "settings.h"
 #include "nandroid.h"
 #include "mounts.h"
 #include "flashutils/flashutils.h"

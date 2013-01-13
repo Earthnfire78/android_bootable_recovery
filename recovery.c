@@ -43,11 +43,19 @@
 #include "encryptedfs_provisioning.h"
 
 #include "extendedcommands.h"
+#include "settings.h"
 #include "flashutils/flashutils.h"
+
+#define ABS_MT_POSITION_X 0x35  /* Center X ellipse position */
+#define ABS_MT_POSITION_Y 0x36  /* Center Y ellipse position */
 
 static const struct option OPTIONS[] = {
   { "send_intent", required_argument, NULL, 's' },
   { "update_package", required_argument, NULL, 'u' },
+  { "update_wiped", required_argument, NULL, 'f' },
+  { "update_mod", required_argument, NULL, 'm' },
+  { "backup", no_argument, NULL, 'b' },
+  { "restore_package", required_argument, NULL, 'r' },
   { "wipe_data", no_argument, NULL, 'w' },
   { "wipe_cache", no_argument, NULL, 'c' },
   { "set_encrypted_filesystems", required_argument, NULL, 'e' },
@@ -62,7 +70,6 @@ static const char *LAST_LOG_FILE = "/cache/recovery/last_log";
 static const char *SDCARD_ROOT = "/sdcard";
 static int allow_display_toggle = 1;
 static int poweroff = 0;
-static const char *SDCARD_PACKAGE_FILE = "/sdcard/update.zip";
 static const char *TEMPORARY_LOG_FILE = "/tmp/recovery.log";
 static const char *SIDELOAD_TEMP_DIR = "/tmp/sideload";
 
@@ -425,10 +432,54 @@ copy_sideloaded_package(const char* original_path) {
   return strdup(copy_path);
 }
 
+int get_battery_level(void)
+{
+	static int lastVal = -1;
+	static time_t nextSecCheck = 0;
+
+	struct timeval curTime;
+	gettimeofday(&curTime, NULL);
+	if (curTime.tv_sec > nextSecCheck)
+	{
+		char cap_s[4];
+		FILE * cap = fopen("/sys/class/power_supply/battery/capacity","rt");
+		if (cap)
+		{
+			fgets(cap_s, 4, cap);
+			fclose(cap);
+			lastVal = atoi(cap_s);
+			if (lastVal > 100)  lastVal = 100;
+			if (lastVal < 0)    lastVal = 0;
+		}
+		nextSecCheck = curTime.tv_sec + 60;
+	}
+	return lastVal;
+}
+
+char* print_batt_cap() {
+	char* full_cap_s = (char*)malloc(30);
+	char full_cap_a[30];
+
+	int cap_i = get_battery_level();
+
+	// Get a usable time
+	struct tm *current;
+	time_t now;
+	now = time(0);
+	current = localtime(&now);
+
+	sprintf(full_cap_a, "Batt: %i%%", cap_i);
+	strcpy(full_cap_s, full_cap_a);
+
+	return full_cap_s;
+}
+	
+
 static char**
 prepend_title(char** headers) {
     char* title[] = { EXPAND(RECOVERY_VERSION),
-                      "",
+		      print_batt_cap(),
+		      "",
                       NULL };
 
     // count the number of lines in our title, plus the
@@ -464,10 +515,16 @@ get_menu_selection(char** headers, char** items, int menu_only,
     int wrap_count = 0;
 
     while (chosen_item < 0 && chosen_item != GO_BACK) {
-        int key = ui_wait_key();
+		struct keyStruct *key;
+		key = ui_wait_key();
+
         int visible = ui_text_visible();
 
-        int action = device_handle_key(key, visible);
+		int action;
+		if(key->code == ABS_MT_POSITION_X)
+	        action = device_handle_mouse(key, visible);
+		else
+	        action = device_handle_key(key->code, visible);
 
         int old_selected = selected;
 
@@ -501,7 +558,7 @@ get_menu_selection(char** headers, char** items, int menu_only,
 
         if (abs(selected - old_selected) > 1) {
             wrap_count++;
-            if (wrap_count == 3) {
+            if (wrap_count == 300) {
                 wrap_count = 0;
                 if (ui_get_showing_back_button()) {
                     ui_print("Back menu button disabled.\n");
@@ -646,50 +703,6 @@ sdcard_directory(const char* path) {
 }
 
 static void
-wipe_data(int confirm) {
-    if (confirm) {
-        static char** title_headers = NULL;
-
-        if (title_headers == NULL) {
-            char* headers[] = { "Confirm wipe of all user data?",
-                                "  THIS CAN NOT BE UNDONE.",
-                                "",
-                                NULL };
-            title_headers = prepend_title((const char**)headers);
-        }
-
-        char* items[] = { " No",
-                          " No",
-                          " No",
-                          " No",
-                          " No",
-                          " No",
-                          " No",
-                          " Yes -- delete all user data",   // [7]
-                          " No",
-                          " No",
-                          " No",
-                          NULL };
-
-        int chosen_item = get_menu_selection(title_headers, items, 1, 0);
-        if (chosen_item != 7) {
-            return;
-        }
-    }
-
-    ui_print("\n-- Wiping data...\n");
-    device_wipe_data();
-    erase_volume("/data");
-    erase_volume("/cache");
-    if (has_datadata()) {
-        erase_volume("/datadata");
-    }
-    erase_volume("/sd-ext");
-    erase_volume("/sdcard/.android_secure");
-    ui_print("Data wipe complete.\n");
-}
-
-static void
 prompt_and_wait() {
     char** headers = prepend_title((const char**)MENU_HEADERS);
 
@@ -708,38 +721,10 @@ prompt_and_wait() {
 
         switch (chosen_item) {
             case ITEM_REBOOT:
-                poweroff=0;
-                return;
-
+                show_power_menu();
+                break;
             case ITEM_WIPE_DATA:
-                wipe_data(ui_text_visible());
-                if (!ui_text_visible()) return;
-                break;
-
-            case ITEM_WIPE_CACHE:
-                if (confirm_selection("Confirm wipe?", "Yes - Wipe Cache"))
-                {
-                    ui_print("\n-- Wiping cache...\n");
-                    erase_volume("/cache");
-                    ui_print("Cache wipe complete.\n");
-                    if (!ui_text_visible()) return;
-                }
-                break;
-
-            case ITEM_APPLY_SDCARD:
-                if (confirm_selection("Confirm install?", "Yes - Install /sdcard/update.zip"))
-                {
-                    ui_print("\n-- Install from sdcard...\n");
-                    int status = install_package(SDCARD_PACKAGE_FILE);
-                    if (status != INSTALL_SUCCESS) {
-                        ui_set_background(BACKGROUND_ICON_ERROR);
-                        ui_print("Installation aborted.\n");
-                    } else if (!ui_text_visible()) {
-                        return;  // reboot if logs aren't visible
-                    } else {
-                        ui_print("\nInstall from sdcard complete.\n");
-                    }
-                }
+                show_wipe_data_menu();
                 break;
             case ITEM_INSTALL_ZIP:
                 show_install_update_menu();
@@ -747,13 +732,10 @@ prompt_and_wait() {
             case ITEM_NANDROID:
                 show_nandroid_menu();
                 break;
-            case ITEM_PARTITION:
-                show_partition_menu();
+            case ITEM_UTILITIES:
+                show_advance_menu();
                 break;
-            case ITEM_ADVANCED:
-                show_advanced_menu();
-                break;
-            case ITEM_POWEROFF:
+            case ITEM_POWERREBOOT:
                 poweroff=1;
                 return;
         }
@@ -812,7 +794,7 @@ main(int argc, char **argv) {
     printf("Starting recovery on %s", ctime(&start));
 
     ui_init();
-    ui_print(EXPAND(RECOVERY_VERSION)"\n");
+    //ui_print(EXPAND(RECOVERY_VERSION)"\n");
     load_volume_table();
     process_volumes();
     LOGI("Processing arguments.\n");
@@ -820,9 +802,13 @@ main(int argc, char **argv) {
 
     int previous_runs = 0;
     const char *send_intent = NULL;
+    const char *update_mod = NULL;
     const char *update_package = NULL;
+    const char *update_wiped = NULL;
+    const char *restore_package = NULL;
     const char *encrypted_fs_mode = NULL;
     int wipe_data = 0, wipe_cache = 0;
+    int backup = 0;
     int toggle_secure_fs = 0;
     encrypted_fs_info encrypted_fs_data;
 
@@ -832,13 +818,17 @@ main(int argc, char **argv) {
         switch (arg) {
         case 'p': previous_runs = atoi(optarg); break;
         case 's': send_intent = optarg; break;
-        case 'u': update_package = optarg; break;
+        case 'c': wipe_cache = 1; break;
+        case 'b': backup = 1; break;
         case 'w': 
 #ifndef BOARD_RECOVERY_ALWAYS_WIPES
-		wipe_data = wipe_cache = 1;
+		wipe_data = 1;
 #endif
 		break;
-        case 'c': wipe_cache = 1; break;
+        case 'm': update_mod = optarg; break;
+        case 'u': update_package = optarg; break;
+        case 'f': update_wiped = optarg; break;
+        case 'r': restore_package = optarg; break;
         case 'e': encrypted_fs_mode = optarg; toggle_secure_fs = 1; break;
         case 't': ui_show_text(1); break;
         case '?':
@@ -868,6 +858,34 @@ main(int argc, char **argv) {
             printf("(replacing path \"%s\" with \"%s\")\n",
                    update_package, modified_path);
             update_package = modified_path;
+        }
+    }
+    if (update_wiped) {
+        // For backwards compatibility on the cache partition only, if
+        // we're given an old 'root' path "CACHE:foo", change it to
+        // "/cache/foo".
+        if (strncmp(update_wiped, "CACHE:", 6) == 0) {
+            int len = strlen(update_wiped) + 10;
+            char* modified_path = malloc(len);
+            strlcpy(modified_path, "/cache/", len);
+            strlcat(modified_path, update_wiped+6, len);
+            printf("(replacing path \"%s\" with \"%s\")\n",
+                   update_wiped, modified_path);
+            update_wiped = modified_path;
+        }
+    }
+    if (restore_package) {
+        // For backwards compatibility on the cache partition only, if
+        // we're given an old 'root' path "CACHE:foo", change it to
+        // "/cache/foo".
+        if (strncmp(restore_package, "CACHE:", 6) == 0) {
+            int len = strlen(restore_package) + 10;
+            char* modified_path = malloc(len);
+            strlcpy(modified_path, "/cache/", len);
+            strlcat(modified_path, restore_package+6, len);
+            printf("(replacing path \"%s\" with \"%s\")\n",
+                   restore_package, modified_path);
+            restore_package = modified_path;
         }
     }
     printf("\n");
@@ -912,18 +930,285 @@ main(int argc, char **argv) {
                 ui_print("Successfully updated Encrypted FS.\n");
                 status = INSTALL_SUCCESS;
             }
+        }} else if (wipe_cache) {
+        ui_set_show_text(1);
+        ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+        ensure_path_mounted("/data");
+        ensure_path_mounted("/cache");
+        ensure_path_mounted("/sd-ext");
+        __system(UPDATING_FORMAT_CASHE);
+        if (format_volume("/cache")) status = INSTALL_ERROR;
+        if (status == INSTALL_SUCCESS) {
+            LOGI("Caches and Wiped Successfully\n");
+            ui_print("Cache wiped.\n");
+            ui_set_show_text(0);
+        } else {
+            LOGI("Auto-Cache-Wipe Failed!\n");
+            ui_set_background(BACKGROUND_ICON_ERROR);
+            ui_print("Cache wipe failed.\n");
+            ui_print("Try again manually or reboot\n");
+        }
+    } else if (backup) {
+        ui_set_show_text(1);
+        ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+        ui_print("\n\nBeginning Auto-Backup...\n\n");
+        ensure_path_mounted("/data");
+        ensure_path_mounted("/cache");
+        ensure_path_mounted("/sd-ext");
+        __system(UPDATING_FORMAT_CASHE);
+        if (format_volume("/cache")) status = INSTALL_ERROR;
+        if (status == INSTALL_SUCCESS) {
+            LOGI("Caches Wiped Successfully\n");
+            ui_print("Cache wiped.\n");
+        } else {
+            LOGI("Auto-Cache-Wipe Failed!\n");
+            ui_print("Cache wipe failed...\n");
+            ui_print("Continuing anyway...\n");
+            ui_print("Reboot later and wipe manually.\n");
+        }
+        status = INSTALL_SUCCESS;
+        char backup_path[PATH_MAX];
+        time_t t = time(NULL);
+        struct tm *tmp1 = localtime(&t);
+        if (tmp1 == NULL) {
+            struct timeval tp;
+            gettimeofday(&tp, NULL);
+            sprintf(backup_path, "/sdcard/clockworkmod/backup/%d", tp.tv_sec);
+        } else {
+            strftime(backup_path, sizeof(backup_path), "/sdcard/clockworkmod/backup/%F.%H.%M.%S", tmp1);
+        }
+        if (nandroid_backup(backup_path)) status = INSTALL_ERROR;
+        if (status != INSTALL_SUCCESS) {
+            ui_print("Auto-Backup Aborted.\n");
+        } else {
+            char tmp2[PATH_MAX];
+            ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+            ui_print("Verifying MD5 sums...\n");
+            sprintf(tmp2, "cd %s && md5sum -c nandroid.md5", backup_path);
+            if (0 != __system(tmp2)) {
+                status = INSTALL_ERROR;
+                ui_set_background(BACKGROUND_ICON_ERROR);
+                ui_set_show_text(1);
+                ui_print("\nError 1 or more md5sums do not match!\n\n");
+                ui_print("Delete %s!\n\n", basename(backup_path));
+                ui_print("Try again manually or reboot\n");
+            }
+        }
+        if (status == INSTALL_SUCCESS) {
+            ui_print("MD5 sums verified!\n");
+            ui_print("Auto-Backup Successfull!\n");
+            ui_set_show_text(0);
+        }
+    } else if (wipe_data) {
+        ui_set_show_text(1);
+        ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+        if (device_wipe_data()) status = INSTALL_ERROR;
+        if (format_volume("/data")) status = INSTALL_ERROR;
+        if (format_volume("/cache")) status = INSTALL_ERROR;
+        if (format_volume("/sd-ext")) status = INSTALL_ERROR;
+        if (status == INSTALL_SUCCESS) {
+            LOGI("Data Wiped Successfully\n");
+            ui_print("Data wiped.\n");
+            ui_set_show_text(0);
+        } else {
+            ui_set_background(BACKGROUND_ICON_ERROR);
+            ui_print("Data wipe failed.\n");
+            ui_print("Try again manually\n");
+        }
+    } else if (update_mod != NULL) {
+        ui_set_show_text(1);
+        ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+        ensure_path_mounted("/data");
+        ensure_path_mounted("/sd-ext");
+        ensure_path_mounted("/cache");
+        __system(UPDATING_FORMAT_CASHE);
+        if (format_volume("/cache")) status = INSTALL_ERROR;
+        if (status == INSTALL_SUCCESS) {
+            LOGI("Starting Auto Backup\n\n");
+        } else {
+            LOGI("Failed to start Auto Backup\n");
+            ui_print("Aborting install\nBackup failed.........\n");
+        }
+        status = INSTALL_SUCCESS;
+        char backup_path[PATH_MAX];
+        time_t t = time(NULL);
+        struct tm *tmp1 = localtime(&t);
+        if (tmp1 == NULL) {
+            struct timeval tp;
+            gettimeofday(&tp, NULL);
+            sprintf(backup_path, "/sdcard/clockworkmod/backup/%d", tp.tv_sec);
+        } else {
+            strftime(backup_path, sizeof(backup_path), "/sdcard/clockworkmod/backup/%F.%H.%M.%S", tmp1);
+        }
+        if (nandroid_backup(backup_path)) status = INSTALL_ERROR;
+        if (status != INSTALL_SUCCESS) {
+            LOGI("Auto-Backup Failed!\n");
+            ui_print("Auto-Backup Aborted.\n");
+        } else {
+            char tmp2[PATH_MAX];
+            sprintf(tmp2, "cd %s && md5sum -c nandroid.md5", backup_path);
+            if (0 != __system(tmp2)) {
+                status = INSTALL_ERROR;
+                ui_set_background(BACKGROUND_ICON_ERROR);
+                ui_set_show_text(1);
+                ui_print("\n---Warning---\nMD5 mismatch!\n%s\n\n", basename(backup_path));
+                ui_print("Try again manually or reboot\n");
+            }
+        }
+        status = INSTALL_SUCCESS;
+        status = install_package(update_mod); 
+        if (status == INSTALL_SUCCESS) {
+            ui_print("Auto-Install Complete!\n");
+            ui_set_show_text(0);
+	} else {
+            ui_set_background(BACKGROUND_ICON_ERROR);
+            ui_print("Auto-Install aborted!\n");
+            ui_print("Try again manually!\n");
         }
     } else if (update_package != NULL) {
-        status = install_package(update_package);
-        if (status != INSTALL_SUCCESS) ui_print("Installation aborted.\n");
-    } else if (wipe_data) {
-        if (device_wipe_data()) status = INSTALL_ERROR;
-        if (erase_volume("/data")) status = INSTALL_ERROR;
-        if (wipe_cache && erase_volume("/cache")) status = INSTALL_ERROR;
-        if (status != INSTALL_SUCCESS) ui_print("Data wipe failed.\n");
-    } else if (wipe_cache) {
-        if (wipe_cache && erase_volume("/cache")) status = INSTALL_ERROR;
-        if (status != INSTALL_SUCCESS) ui_print("Cache wipe failed.\n");
+        ui_set_show_text(1);
+        ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+        ensure_path_mounted("/data");
+        ensure_path_mounted("/sd-ext");
+        ensure_path_mounted("/cache");
+        __system(UPDATING_FORMAT_CASHE);
+        if (format_volume("/cache")) status = INSTALL_ERROR;
+        if (status == INSTALL_SUCCESS) {
+            LOGI("Starting Auto Backup\n\n");
+        } else {
+            LOGI("Failed to start Auto Backup\n");
+            ui_print("Aborting install\nBackup failed.........\n");
+        }
+        status = INSTALL_SUCCESS;
+        char backup_path[PATH_MAX];
+        time_t t = time(NULL);
+        struct tm *tmp1 = localtime(&t);
+        if (tmp1 == NULL) {
+            struct timeval tp;
+            gettimeofday(&tp, NULL);
+            sprintf(backup_path, "/sdcard/clockworkmod/backup/%d", tp.tv_sec);
+        } else {
+            strftime(backup_path, sizeof(backup_path), "/sdcard/clockworkmod/backup/%F.%H.%M.%S", tmp1);
+        }
+        if (nandroid_backup(backup_path)) status = INSTALL_ERROR;
+        if (status != INSTALL_SUCCESS) {
+            ui_print("Auto-Backup Aborted.\n");
+        } else {
+            char tmp2[PATH_MAX];
+            sprintf(tmp2, "cd %s && md5sum -c nandroid.md5", backup_path);
+            if (0 != __system(tmp2)) {
+                status = INSTALL_ERROR;
+                ui_set_background(BACKGROUND_ICON_ERROR);
+                ui_set_show_text(1);
+                ui_print("\n---Warning---\nMD5 mismatch!\n%s\n\n", basename(backup_path));
+                ui_print("Try again manually or reboot\n");
+            }
+            ui_print("\nPreparing for package install\n");
+            ui_print("     ----------\n");
+            ensure_path_mounted("/data");
+            ensure_path_mounted("/cache");
+            ensure_path_mounted("/sd-ext");
+            __system(UPDATING_FORMAT_DATA);
+            if (format_volume("/boot")) status = INSTALL_ERROR;
+            if (format_volume("/system")) status = INSTALL_ERROR;
+            if (status != INSTALL_SUCCESS) {
+                ui_set_background(BACKGROUND_ICON_ERROR);
+                LOGI("Auto data/data wipe failed!\n");
+                ui_print("-- Try again manually!\n");
+            }
+        }
+        status = INSTALL_SUCCESS;
+        status = install_package(update_package); 
+        if (status == INSTALL_SUCCESS) {
+            ui_print("Auto-Install Complete!\n");
+            ui_set_show_text(0);
+	} else {
+            ui_set_background(BACKGROUND_ICON_ERROR);
+            ui_print("Auto-Install aborted!\n");
+            ui_print("-- Try again manually!\n");
+        }
+    } else if (update_wiped != NULL) {
+        ui_set_show_text(1);
+        ui_set_background(BACKGROUND_ICON_CLOCKWORK);
+        ensure_path_mounted("/data");
+        ensure_path_mounted("/sd-ext");
+        ensure_path_mounted("/cache");
+        __system(UPDATING_FORMAT_CASHE);
+        if (format_volume("/cache")) status = INSTALL_ERROR;
+        if (status == INSTALL_SUCCESS) {
+            LOGI("Starting Auto Backup\n\n");
+        } else {
+            LOGI("Failed to start Auto Backup\n");
+            ui_print("Aborting install\nBackup failed.........\n");
+        }
+        status = INSTALL_SUCCESS;
+        char backup_path[PATH_MAX];
+        time_t t = time(NULL);
+        struct tm *tmp1 = localtime(&t);
+        if (tmp1 == NULL) {
+            struct timeval tp;
+            gettimeofday(&tp, NULL);
+            sprintf(backup_path, "/sdcard/clockworkmod/backup/%d", tp.tv_sec);
+        } else {
+            strftime(backup_path, sizeof(backup_path), "/sdcard/clockworkmod/backup/%F.%H.%M.%S", tmp1);
+        }
+        if (nandroid_backup(backup_path)) status = INSTALL_ERROR;
+        if (status != INSTALL_SUCCESS) {
+            ui_print("Auto-Backup Aborted.\n");
+        } else {
+            char tmp2[PATH_MAX];
+            sprintf(tmp2, "cd %s && md5sum -c nandroid.md5", backup_path);
+            if (0 != __system(tmp2)) {
+                status = INSTALL_ERROR;
+                ui_set_background(BACKGROUND_ICON_ERROR);
+                ui_set_show_text(1);
+                ui_print("\n---Warning---\nMD5 mismatch!\n%s\n\n", basename(backup_path));
+                ui_print("Try again manually or reboot\n");
+            }
+            ui_print("\nPreparing for package install\n");
+            ui_print("     ----------\n");
+            ensure_path_mounted("/data");
+            ensure_path_mounted("/cache");
+            ensure_path_mounted("/sd-ext");
+            if (device_wipe_data()) status = INSTALL_ERROR;
+            if (format_volume("/boot")) status = INSTALL_ERROR;
+            if (format_volume("/system")) status = INSTALL_ERROR;
+            if (format_volume("/data")) status = INSTALL_ERROR;
+            if (format_volume("/sd-ext")) status = INSTALL_ERROR;
+            if (status != INSTALL_SUCCESS) {
+                ui_set_background(BACKGROUND_ICON_ERROR);
+                LOGI("Auto Full Wipe Failed!\n");
+                ui_print("-- Try again manually!\n");
+            }
+        }
+        status = INSTALL_SUCCESS;
+        status = install_package(update_wiped);
+        if (status == INSTALL_SUCCESS) {
+            ui_print("Auto-Install Complete!\n");
+            ui_set_show_text(0);
+	} else {
+            ui_set_background(BACKGROUND_ICON_ERROR);
+            ui_print("Auto-Install aborted!\n");
+            ui_print("-- Try again manually!\n");
+        }
+    } else if (restore_package != NULL) {
+
+        ui_set_show_text(1);
+        ui_set_background(BACKGROUND_ICON_INSTALLING);
+        ui_print("\n\nAuto-Restoring\n%s\n\nPlease be patient...\n\n", basename(restore_package));
+        if (nandroid_restore(restore_package, 1, 1, 1, 1, 1, 0)) status = INSTALL_ERROR;
+        if (status == INSTALL_SUCCESS) {
+            LOGI("Nandroid restore successfull\n");
+            ui_print("Backup %s restore successfull!\n", basename(restore_package));
+            ui_set_show_text(0);
+        } else {
+            LOGI("Auto-Restore Failed!\n");
+            ui_set_background(BACKGROUND_ICON_ERROR);
+            ui_print("\n----Warning!----\n");
+            ui_print("Auto-Restore Failed for\n%s\n\n", restore_package);
+            ui_print("Try again manually or reboot\n");
+            ui_print("------------------\n\n");
+        }
     } else {
         LOGI("Checking for extendedcommand...\n");
         status = INSTALL_ERROR;  // No command specified

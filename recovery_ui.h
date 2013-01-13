@@ -67,20 +67,30 @@ int device_wipe_data();
 #define GO_BACK             -5
 
 #define ITEM_REBOOT          0
-#define ITEM_APPLY_SDCARD    1
-#define ITEM_WIPE_DATA       2
-#define ITEM_WIPE_CACHE      3
-#define ITEM_INSTALL_ZIP     4
-#define ITEM_NANDROID        5
-#define ITEM_PARTITION       6
-#define ITEM_ADVANCED        7
-#define ITEM_POWEROFF        8          
+#define ITEM_WIPE_DATA       1
+#define ITEM_INSTALL_ZIP     2
+#define ITEM_NANDROID        3
+#define ITEM_UTILITIES       4
+#define ITEM_POWERREBOOT     5        
 
 // Header text to display above the main menu.
 extern char* MENU_HEADERS[];
 
 // Text of menu items.
 extern char* MENU_ITEMS[];
+
+#define MENU_ICON_X			0
+#define MENU_ICON_Y			1
+#define MENU_ICON_XL		2
+#define MENU_ICON_XR		3
+
+extern int TOUCH_CONTROL_DEBUG;
+extern int TOUCH_NOSHOW_LOG;
+
+extern int maxX;
+extern int maxY;
+
+int get_menu_icon_info(int indx1, int indx2);
 
 int
 get_menu_selection(char** headers, char** items, int menu_only, int initial_selection);

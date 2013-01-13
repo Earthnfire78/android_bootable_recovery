@@ -36,6 +36,7 @@
 #include <sys/vfs.h>
 
 #include "extendedcommands.h"
+#include "settings.h"
 #include "nandroid.h"
 #include "mounts.h"
 
@@ -145,9 +146,12 @@ static nandroid_backup_handler get_backup_handler(const char *backup_path) {
     }
 
     // cwr5, we prefer tar for everything except yaffs2
+    /*
+     * Remove this blocker to test tar backups of yaffs2 filesystems
     if (strcmp("yaffs2", mv->filesystem) == 0) {
         return mkyaffs2image_wrapper;
     }
+    */
 
     char str[255];
     char* partition;
@@ -315,7 +319,7 @@ int nandroid_backup(const char* backup_path)
     }
     
     sync();
-    ui_set_background(BACKGROUND_ICON_NONE);
+    ui_set_background(BACKGROUND_ICON_CLOCKWORK);
     ui_reset_progress();
     ui_print("\nBackup complete!\n");
     return 0;
@@ -522,10 +526,10 @@ int nandroid_restore(const char* backup_path, int restore_boot, int restore_syst
     
     char tmp[PATH_MAX];
 
-    ui_print("Checking MD5 sums...\n");
+    ui_print("\nChecking MD5 sums...\nPlease be patient...\n\n");
     sprintf(tmp, "cd %s && md5sum -c nandroid.md5", backup_path);
     if (0 != __system(tmp))
-        return print_and_error("MD5 mismatch!\n");
+        return print_and_error("\n---Warning---\nMD5 mismatch!\n\nDeleting backup!\n");
     
     int ret;
 
@@ -582,7 +586,7 @@ int nandroid_restore(const char* backup_path, int restore_boot, int restore_syst
         return ret;
 
     sync();
-    ui_set_background(BACKGROUND_ICON_NONE);
+    ui_set_background(BACKGROUND_ICON_CLOCKWORK);
     ui_reset_progress();
     ui_print("\nRestore complete!\n");
     return 0;
